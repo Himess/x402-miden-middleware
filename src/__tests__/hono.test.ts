@@ -298,6 +298,65 @@ describe("Hono midenPaywall", () => {
     ).toThrow("not yet implemented");
   });
 
+  it("handles 10 concurrent requests with different valid payment headers", async () => {
+    const app = createApp();
+
+    const requests = Array.from({ length: 10 }, (_, i) => {
+      const paymentHeader = makePaymentHeader({
+        payload: {
+          from: `0xsender_${i}`,
+          provenTransaction: "deadbeef",
+          transactionId: `tx_concurrent_${i}`,
+        },
+      });
+
+      return app.request("/api/premium/data", {
+        headers: { Payment: paymentHeader },
+      });
+    });
+
+    const responses = await Promise.all(requests);
+    for (const res of responses) {
+      expect(res.status).toBe(200);
+      const body = await res.json();
+      expect(body.data).toBe("premium content");
+    }
+  });
+
+  it("handles 10 concurrent requests with same payment header (replay protection)", async () => {
+    const app = createApp();
+    const paymentHeader = makePaymentHeader({
+      payload: {
+        from: "0xsender_same",
+        provenTransaction: "deadbeef",
+        transactionId: "tx_replay_concurrent",
+      },
+    });
+
+    const requests = Array.from({ length: 10 }, () =>
+      app.request("/api/premium/data", {
+        headers: { Payment: paymentHeader },
+      }),
+    );
+
+    const responses = await Promise.all(requests);
+    const statuses = responses.map((r) => r.status);
+    const passed = statuses.filter((s) => s === 200);
+    const rejected = statuses.filter((s) => s === 402);
+
+    // Only the first should pass; rest should be rejected as replays
+    expect(passed.length).toBe(1);
+    expect(rejected.length).toBe(9);
+
+    // Verify rejected ones mention replay
+    for (const res of responses) {
+      if (res.status === 402) {
+        const body = await res.json();
+        expect(body.error).toContain("replay");
+      }
+    }
+  });
+
   it("rejects replay of same transactionId on second request", async () => {
     const app = createApp();
     const paymentHeader = makePaymentHeader();

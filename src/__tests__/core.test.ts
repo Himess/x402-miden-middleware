@@ -7,6 +7,7 @@ import {
   verifyPayment,
   extractPaymentInfo,
   createReplayGuard,
+  createCircuitBreaker,
 } from "../core.js";
 import type { MidenPaywallConfig, V2PaymentPayload } from "../types.js";
 
@@ -465,6 +466,7 @@ describe("verifyPayment", () => {
     const config: MidenPaywallConfig = {
       ...DEFAULT_CONFIG,
       facilitatorUrl: "http://localhost:4402",
+      maxRetries: 0, // No retries for this test
     };
 
     const result = await verifyPayment(makeValidPayload(), config);
@@ -481,6 +483,7 @@ describe("verifyPayment", () => {
     const config: MidenPaywallConfig = {
       ...DEFAULT_CONFIG,
       facilitatorUrl: "http://localhost:4402",
+      maxRetries: 0, // No retries for this test
     };
 
     const result = await verifyPayment(makeValidPayload(), config);
@@ -676,4 +679,306 @@ describe("verifyPayment - facilitator fetch timeout", () => {
 
     vi.unstubAllGlobals();
   });
+});
+
+// ============================================================================
+// extractPayment - URL-safe base64
+// ============================================================================
+
+describe("extractPayment URL-safe base64", () => {
+  it("decodes standard base64", () => {
+    const payload = makeValidPayload();
+    const encoded = btoa(JSON.stringify(payload));
+    expect(extractPayment(encoded)).not.toBeNull();
+  });
+
+  it("decodes URL-safe base64 (with - and _)", () => {
+    const payload = makeValidPayload();
+    const standard = btoa(JSON.stringify(payload));
+    // Convert to URL-safe: replace + with -, / with _, remove =
+    const urlSafe = standard.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    expect(extractPayment(urlSafe)).not.toBeNull();
+    expect(extractPayment(urlSafe)!.payload.transactionId).toBe("tx_001");
+  });
+
+  it("decodes URL-safe base64 without padding", () => {
+    const payload = makeValidPayload();
+    const standard = btoa(JSON.stringify(payload));
+    // Strip padding
+    const noPadding = standard.replace(/=+$/, "");
+    expect(extractPayment(noPadding)).not.toBeNull();
+  });
+});
+
+// ============================================================================
+// extractPayment - zod schema validation
+// ============================================================================
+
+describe("extractPayment zod schema validation", () => {
+  it("rejects payload with wrong x402Version type", () => {
+    const encoded = btoa(JSON.stringify({
+      x402Version: "2", // should be number literal 2
+      accepted: {
+        scheme: "exact",
+        network: "miden:testnet",
+        amount: "1000",
+        payTo: "0xrecipient",
+        asset: "0xfaucet",
+      },
+      payload: {
+        from: "0xsender",
+        provenTransaction: "deadbeef",
+        transactionId: "tx_001",
+      },
+    }));
+    expect(extractPayment(encoded)).toBeNull();
+  });
+
+  it("rejects payload with missing accepted fields", () => {
+    const encoded = btoa(JSON.stringify({
+      x402Version: 2,
+      accepted: {
+        scheme: "exact",
+        // missing: network, amount, payTo, asset
+      },
+      payload: {
+        from: "0xsender",
+        provenTransaction: "deadbeef",
+        transactionId: "tx_001",
+      },
+    }));
+    expect(extractPayment(encoded)).toBeNull();
+  });
+
+  it("accepts payload with optional fields", () => {
+    const payload = makeValidPayload();
+    payload.payload.noteData = "aabbccdd";
+    payload.accepted.privacyMode = "trusted";
+    const encoded = btoa(JSON.stringify(payload));
+    const decoded = extractPayment(encoded);
+    expect(decoded).not.toBeNull();
+    expect(decoded!.payload.noteData).toBe("aabbccdd");
+  });
+});
+
+// ============================================================================
+// validatePaymentPayload - maxTimeoutSeconds
+// ============================================================================
+
+describe("validatePaymentPayload maxTimeoutSeconds", () => {
+  it("accepts payload without maxTimeoutSeconds", () => {
+    const payload = makeValidPayload();
+    delete (payload.accepted as Record<string, unknown>).maxTimeoutSeconds;
+    const result = validatePaymentPayload(payload, DEFAULT_CONFIG);
+    expect(result.valid).toBe(true);
+  });
+
+  it("accepts payload with valid positive maxTimeoutSeconds", () => {
+    const payload = makeValidPayload();
+    payload.accepted.maxTimeoutSeconds = 300;
+    const result = validatePaymentPayload(payload, DEFAULT_CONFIG);
+    expect(result.valid).toBe(true);
+  });
+
+  it("rejects payload with zero maxTimeoutSeconds", () => {
+    const payload = makeValidPayload();
+    payload.accepted.maxTimeoutSeconds = 0;
+    const result = validatePaymentPayload(payload, DEFAULT_CONFIG);
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain("maxTimeoutSeconds");
+  });
+
+  it("rejects payload with negative maxTimeoutSeconds", () => {
+    const payload = makeValidPayload();
+    payload.accepted.maxTimeoutSeconds = -10;
+    const result = validatePaymentPayload(payload, DEFAULT_CONFIG);
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain("maxTimeoutSeconds");
+  });
+});
+
+// ============================================================================
+// createCircuitBreaker
+// ============================================================================
+
+describe("createCircuitBreaker", () => {
+  it("starts in closed state", () => {
+    const cb = createCircuitBreaker();
+    expect(cb.state).toBe("closed");
+    expect(cb.canRequest()).toBe(true);
+  });
+
+  it("stays closed below failure threshold", () => {
+    const cb = createCircuitBreaker({ failureThreshold: 3 });
+    cb.recordFailure();
+    cb.recordFailure();
+    expect(cb.state).toBe("closed");
+    expect(cb.canRequest()).toBe(true);
+  });
+
+  it("opens after reaching failure threshold", () => {
+    const cb = createCircuitBreaker({ failureThreshold: 3 });
+    cb.recordFailure();
+    cb.recordFailure();
+    cb.recordFailure();
+    expect(cb.state).toBe("open");
+    expect(cb.canRequest()).toBe(false);
+  });
+
+  it("transitions to half-open after reset time", () => {
+    const cb = createCircuitBreaker({ failureThreshold: 2, resetTimeMs: 100 });
+    cb.recordFailure();
+    cb.recordFailure();
+    expect(cb.state).toBe("open");
+    expect(cb.canRequest()).toBe(false);
+
+    // Fast-forward time
+    vi.useFakeTimers();
+    vi.advanceTimersByTime(150);
+    expect(cb.canRequest()).toBe(true);
+    expect(cb.state).toBe("half-open");
+    vi.useRealTimers();
+  });
+
+  it("closes again on success after half-open", () => {
+    const cb = createCircuitBreaker({ failureThreshold: 2, resetTimeMs: 100 });
+    cb.recordFailure();
+    cb.recordFailure();
+
+    vi.useFakeTimers();
+    vi.advanceTimersByTime(150);
+    cb.canRequest(); // transitions to half-open
+    cb.recordSuccess();
+    expect(cb.state).toBe("closed");
+    expect(cb.canRequest()).toBe(true);
+    vi.useRealTimers();
+  });
+
+  it("re-opens on failure in half-open state", () => {
+    const cb = createCircuitBreaker({ failureThreshold: 1, resetTimeMs: 100 });
+    cb.recordFailure();
+    expect(cb.state).toBe("open");
+
+    vi.useFakeTimers();
+    vi.advanceTimersByTime(150);
+    cb.canRequest(); // transitions to half-open
+    cb.recordFailure();
+    expect(cb.state).toBe("open");
+    vi.useRealTimers();
+  });
+
+  it("resets failure count on success", () => {
+    const cb = createCircuitBreaker({ failureThreshold: 3 });
+    cb.recordFailure();
+    cb.recordFailure();
+    cb.recordSuccess();
+    // After success, counter is reset; need 3 more failures to open
+    cb.recordFailure();
+    cb.recordFailure();
+    expect(cb.state).toBe("closed");
+    cb.recordFailure();
+    expect(cb.state).toBe("open");
+  });
+});
+
+// ============================================================================
+// fetchWithRetry (via verifyPayment)
+// ============================================================================
+
+describe("verifyPayment retry logic", () => {
+  it("retries on 5xx and eventually succeeds", async () => {
+    let attempt = 0;
+    const mockFetch = vi.fn().mockImplementation(async () => {
+      attempt++;
+      if (attempt < 3) {
+        return { ok: false, status: 503, text: async () => "Service Unavailable" };
+      }
+      return { ok: true, json: async () => ({ valid: true, transactionId: "tx_retry_ok" }) };
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const config: MidenPaywallConfig = {
+      ...DEFAULT_CONFIG,
+      facilitatorUrl: "http://localhost:4402",
+      maxRetries: 3,
+      verifyTimeoutMs: 30000,
+    };
+
+    const result = await verifyPayment(makeValidPayload(), config);
+    expect(result.valid).toBe(true);
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+
+    vi.unstubAllGlobals();
+  }, 15000);
+
+  it("does not retry on 4xx", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 400,
+      text: async () => "Bad Request",
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const config: MidenPaywallConfig = {
+      ...DEFAULT_CONFIG,
+      facilitatorUrl: "http://localhost:4402",
+      maxRetries: 3,
+    };
+
+    const result = await verifyPayment(makeValidPayload(), config);
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain("400");
+    // Should only be called once (no retries for 4xx)
+    expect(mockFetch).toHaveBeenCalledTimes(1);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("retries on network errors", async () => {
+    let attempt = 0;
+    const mockFetch = vi.fn().mockImplementation(async () => {
+      attempt++;
+      if (attempt < 2) {
+        throw new Error("ECONNRESET");
+      }
+      return { ok: true, json: async () => ({ valid: true, transactionId: "tx_retry_ok" }) };
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const config: MidenPaywallConfig = {
+      ...DEFAULT_CONFIG,
+      facilitatorUrl: "http://localhost:4402",
+      maxRetries: 3,
+      verifyTimeoutMs: 30000,
+    };
+
+    const result = await verifyPayment(makeValidPayload(), config);
+    expect(result.valid).toBe(true);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+
+    vi.unstubAllGlobals();
+  }, 15000);
+
+  it("gives up after maxRetries", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 500,
+      text: async () => "Internal Server Error",
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const config: MidenPaywallConfig = {
+      ...DEFAULT_CONFIG,
+      facilitatorUrl: "http://localhost:4402",
+      maxRetries: 2,
+      verifyTimeoutMs: 30000,
+    };
+
+    const result = await verifyPayment(makeValidPayload(), config);
+    expect(result.valid).toBe(false);
+    // 1 initial + 2 retries = 3 total
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+
+    vi.unstubAllGlobals();
+  }, 15000);
 });

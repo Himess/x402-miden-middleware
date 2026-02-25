@@ -8,6 +8,7 @@
  * - Replay protection via LRU transaction ID dedup
  */
 
+import { z } from "zod";
 import type {
   MidenPaywallConfig,
   MidenPaymentRequirements,
@@ -17,6 +18,30 @@ import type {
   PaymentInfo,
   PaywallLogger,
 } from "./types.js";
+
+// ============================================================================
+// Zod Schema for Payment Payload
+// ============================================================================
+
+const PaymentPayloadSchema = z.object({
+  x402Version: z.literal(2),
+  accepted: z.object({
+    scheme: z.string(),
+    network: z.string(),
+    amount: z.string(),
+    payTo: z.string(),
+    maxTimeoutSeconds: z.number().positive().optional(),
+    asset: z.string(),
+    privacyMode: z.string().optional(),
+  }),
+  payload: z.object({
+    from: z.string(),
+    provenTransaction: z.string(),
+    transactionId: z.string(),
+    noteData: z.string().optional(),
+  }),
+  resource: z.object({ url: z.string(), method: z.string() }).optional(),
+});
 
 /** Default logger — falls back to console. */
 const defaultLogger: PaywallLogger = {
@@ -60,6 +85,112 @@ export function createReplayGuard(maxSize = 10000) {
       return true;
     },
   };
+}
+
+// ============================================================================
+// URL-safe Base64 Decoding
+// ============================================================================
+
+/**
+ * Decodes a base64 string, handling URL-safe base64 variants.
+ *
+ * Converts `-` to `+`, `_` to `/`, and adds padding if needed before calling `atob`.
+ */
+function decodeBase64(encoded: string): string {
+  // Handle URL-safe base64
+  let standard = encoded.replace(/-/g, "+").replace(/_/g, "/");
+  // Add padding if needed
+  while (standard.length % 4 !== 0) standard += "=";
+  return atob(standard);
+}
+
+// ============================================================================
+// Circuit Breaker
+// ============================================================================
+
+/**
+ * Creates a simple circuit breaker for facilitator requests.
+ *
+ * - **closed**: Normal operation. Requests pass through.
+ * - **open**: Too many failures. Requests are blocked until `resetTimeMs` elapses.
+ * - **half-open**: After reset time, allows one request to test recovery.
+ */
+export function createCircuitBreaker(
+  options: { failureThreshold?: number; resetTimeMs?: number } = {},
+) {
+  const threshold = options.failureThreshold ?? 5;
+  const resetTime = options.resetTimeMs ?? 30000;
+  let failures = 0;
+  let lastFailure = 0;
+  let state: "closed" | "open" | "half-open" = "closed";
+
+  return {
+    get state() {
+      return state;
+    },
+    recordSuccess() {
+      failures = 0;
+      state = "closed";
+    },
+    recordFailure() {
+      failures++;
+      lastFailure = Date.now();
+      if (failures >= threshold) state = "open";
+    },
+    canRequest(): boolean {
+      if (state === "closed") return true;
+      if (state === "open" && Date.now() - lastFailure >= resetTime) {
+        state = "half-open";
+        return true;
+      }
+      return state === "half-open";
+    },
+  };
+}
+
+// ============================================================================
+// Facilitator Fetch with Retry
+// ============================================================================
+
+/**
+ * Fetches a URL with exponential backoff retry logic.
+ *
+ * Only retries on network errors and 5xx responses. 4xx responses are returned immediately.
+ * Abort errors are re-thrown without retrying.
+ */
+async function fetchWithRetry(
+  url: string,
+  opts: RequestInit,
+  maxRetries: number,
+  signal: AbortSignal,
+  logger: PaywallLogger,
+): Promise<Response> {
+  let lastError: Error | undefined;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      const res = await fetch(url, { ...opts, signal });
+      if (res.ok || res.status < 500) return res;
+      lastError = new Error(`Facilitator returned ${res.status}`);
+      if (attempt < maxRetries) {
+        const delay = Math.pow(2, attempt) * 1000;
+        logger.warn(
+          `Facilitator returned ${res.status}, retrying in ${delay}ms (attempt ${attempt + 1}/${maxRetries})`,
+        );
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err));
+      if (err instanceof DOMException && err.name === "AbortError") throw err;
+      if (attempt < maxRetries) {
+        const delay = Math.pow(2, attempt) * 1000;
+        logger.warn(
+          `Facilitator fetch failed, retrying in ${delay}ms: ${lastError.message}`,
+        );
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+  }
+  throw lastError ?? new Error("Facilitator request failed after retries");
 }
 
 // ============================================================================
@@ -123,37 +254,14 @@ export function extractPayment(
   }
 
   try {
-    const json = atob(paymentHeader);
-    const parsed = JSON.parse(json) as Record<string, unknown>;
+    const json = decodeBase64(paymentHeader);
+    const parsed = JSON.parse(json);
 
-    // Runtime validation of required fields
-    if (
-      parsed.x402Version !== 2 ||
-      !parsed.accepted ||
-      typeof parsed.accepted !== "object" ||
-      !parsed.payload ||
-      typeof parsed.payload !== "object"
-    ) {
-      return null;
-    }
+    // Validate with zod schema
+    const result = PaymentPayloadSchema.safeParse(parsed);
+    if (!result.success) return null;
 
-    const accepted = parsed.accepted as Record<string, unknown>;
-    const payload = parsed.payload as Record<string, unknown>;
-
-    if (
-      typeof accepted.scheme !== "string" ||
-      typeof accepted.network !== "string" ||
-      typeof accepted.amount !== "string" ||
-      typeof accepted.payTo !== "string" ||
-      typeof accepted.asset !== "string" ||
-      typeof payload.from !== "string" ||
-      typeof payload.provenTransaction !== "string" ||
-      typeof payload.transactionId !== "string"
-    ) {
-      return null;
-    }
-
-    return parsed as unknown as V2PaymentPayload;
+    return result.data as unknown as V2PaymentPayload;
   } catch {
     return null;
   }
@@ -220,6 +328,13 @@ export function validatePaymentPayload(
       valid: false,
       error: `Insufficient payment: required ${config.price}, got ${accepted.amount}`,
     };
+  }
+
+  // Validate maxTimeoutSeconds if present
+  if (accepted.maxTimeoutSeconds !== undefined) {
+    if (typeof accepted.maxTimeoutSeconds !== "number" || accepted.maxTimeoutSeconds <= 0) {
+      return { valid: false, error: "maxTimeoutSeconds must be a positive number" };
+    }
   }
 
   // Check payload has required fields (non-empty)
@@ -295,10 +410,14 @@ export function validateConfig(config: MidenPaywallConfig): void {
  * - A custom verify function (for testing or inline verification)
  * - A remote facilitator URL (for production)
  * - Rejects if neither is configured (secure by default)
+ *
+ * When using a remote facilitator, the optional `circuitBreaker` parameter
+ * controls whether requests are blocked after repeated failures.
  */
 export async function verifyPayment(
   payload: V2PaymentPayload,
   config: MidenPaywallConfig,
+  circuitBreaker?: ReturnType<typeof createCircuitBreaker>,
 ): Promise<VerifyResponse> {
   const log = resolveLogger(config);
 
@@ -327,7 +446,29 @@ export async function verifyPayment(
 
   // Remote facilitator
   if (config.facilitatorUrl) {
-    return verifyWithFacilitator(payload, config.facilitatorUrl, config);
+    // Circuit breaker check
+    if (circuitBreaker && !circuitBreaker.canRequest()) {
+      log.warn("Circuit breaker open — facilitator requests blocked");
+      return {
+        valid: false,
+        error: "Payment verification temporarily unavailable",
+      };
+    }
+
+    try {
+      const result = await verifyWithFacilitator(payload, config.facilitatorUrl, config);
+      if (circuitBreaker) {
+        if (result.valid) {
+          circuitBreaker.recordSuccess();
+        } else {
+          circuitBreaker.recordFailure();
+        }
+      }
+      return result;
+    } catch (err) {
+      if (circuitBreaker) circuitBreaker.recordFailure();
+      throw err;
+    }
   }
 
   // No facilitator configured — reject by default (secure)
@@ -342,7 +483,7 @@ export async function verifyPayment(
 /**
  * Sends verification request to a remote facilitator service.
  *
- * Uses an AbortController to enforce a timeout on the fetch request.
+ * Uses an AbortController to enforce a timeout and exponential backoff retry logic.
  */
 async function verifyWithFacilitator(
   payload: V2PaymentPayload,
@@ -352,17 +493,23 @@ async function verifyWithFacilitator(
   const log = resolveLogger(config);
   const url = `${facilitatorUrl.replace(/\/$/, "")}/verify`;
   const timeoutMs = config.verifyTimeoutMs ?? 10000;
+  const maxRetries = config.maxRetries ?? 3;
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ payload }),
-      signal: controller.signal,
-    });
+    const response = await fetchWithRetry(
+      url,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ payload }),
+      },
+      maxRetries,
+      controller.signal,
+      log,
+    );
 
     if (!response.ok) {
       const text = await response.text().catch(() => "");

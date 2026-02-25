@@ -25,7 +25,7 @@
  * @module
  */
 
-import type { Context, MiddlewareHandler } from "hono";
+import type { MiddlewareHandler } from "hono";
 import type { MidenPaywallConfig, PaymentInfo } from "./types.js";
 import {
   buildPaymentRequired,
@@ -35,6 +35,7 @@ import {
   validateConfig,
   resolveLogger,
   createReplayGuard,
+  createCircuitBreaker,
 } from "./core.js";
 
 /**
@@ -65,13 +66,14 @@ export type PaymentEnv = {
  * Requests with a valid, verified payment header pass through to the next handler
  * with `c.get("paymentInfo")` populated.
  */
-export function midenPaywall(config: MidenPaywallConfig): MiddlewareHandler {
+export function midenPaywall(config: MidenPaywallConfig): MiddlewareHandler<PaymentEnv> {
   validateConfig(config);
 
   const log = resolveLogger(config);
   const replayGuard = createReplayGuard();
+  const circuitBreaker = createCircuitBreaker();
 
-  return async (c: Context, next) => {
+  return async (c, next) => {
     const paymentHeader = c.req.header("payment");
 
     // No payment header -> return 402
@@ -93,9 +95,18 @@ export function midenPaywall(config: MidenPaywallConfig): MiddlewareHandler {
       return c.json({ error: "Invalid Payment header encoding" }, 400);
     }
 
+    // Circuit breaker check
+    if (!circuitBreaker.canRequest()) {
+      log.warn("Circuit breaker open — facilitator requests blocked");
+      return c.json(
+        { error: "Payment verification temporarily unavailable" },
+        503,
+      );
+    }
+
     // Verify with facilitator
     try {
-      const result = await verifyPayment(payload, config);
+      const result = await verifyPayment(payload, config, circuitBreaker);
 
       if (!result.valid) {
         return c.json(

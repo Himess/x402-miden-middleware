@@ -22,6 +22,7 @@ export {
   verifyPayment,
   extractPaymentInfo,
   createReplayGuard,
+  createCircuitBreaker,
 } from "./core.js";
 
 // Types

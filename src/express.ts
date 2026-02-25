@@ -36,6 +36,7 @@ import {
   validateConfig,
   resolveLogger,
   createReplayGuard,
+  createCircuitBreaker,
 } from "./core.js";
 
 // Extend Express Request to include paymentInfo
@@ -60,6 +61,7 @@ export function midenPaywall(config: MidenPaywallConfig): RequestHandler {
 
   const log = resolveLogger(config);
   const replayGuard = createReplayGuard();
+  const circuitBreaker = createCircuitBreaker();
 
   return async (req: Request, res: Response, next: NextFunction) => {
     const paymentHeader = req.headers["payment"] as string | undefined;
@@ -86,9 +88,18 @@ export function midenPaywall(config: MidenPaywallConfig): RequestHandler {
       return;
     }
 
+    // Circuit breaker check
+    if (!circuitBreaker.canRequest()) {
+      log.warn("Circuit breaker open — facilitator requests blocked");
+      res.status(503).json({
+        error: "Payment verification temporarily unavailable",
+      });
+      return;
+    }
+
     // Verify with facilitator
     try {
-      const result = await verifyPayment(payload, config);
+      const result = await verifyPayment(payload, config, circuitBreaker);
 
       if (!result.valid) {
         res.status(402).json({

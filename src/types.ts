@@ -111,6 +111,8 @@ export interface MidenPaywallConfig {
   logger?: PaywallLogger;
   /** Timeout in milliseconds for facilitator fetch requests. Defaults to 10000 (10s). */
   verifyTimeoutMs?: number;
+  /** Maximum number of retry attempts for facilitator requests. Defaults to 3. Only retries on network errors and 5xx responses. */
+  maxRetries?: number;
 }
 
 /** Lightweight resource info for 402 response. */

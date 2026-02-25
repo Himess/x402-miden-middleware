@@ -597,6 +597,110 @@ describe("Express midenPaywall", () => {
     });
   });
 
+  it("handles 10 concurrent requests with different valid payment headers", async () => {
+    const middleware = midenPaywall(DEFAULT_CONFIG);
+
+    const requests = Array.from({ length: 10 }, (_, i) => {
+      const paymentHeader = makePaymentHeader({
+        payload: {
+          from: `0xsender_${i}`,
+          provenTransaction: "deadbeef",
+          transactionId: `tx_concurrent_${i}`,
+        },
+      });
+
+      return new Promise<{ status: number; passed: boolean }>((resolve) => {
+        const req = {
+          method: "GET",
+          originalUrl: "/api/premium/data",
+          protocol: "http",
+          headers: { payment: paymentHeader },
+          get: (name: string) =>
+            name.toLowerCase() === "host" ? "localhost:3000" : undefined,
+        } as unknown as express.Request;
+
+        let statusCode = 0;
+        const res = {
+          status: (code: number) => {
+            statusCode = code;
+            return res;
+          },
+          json: () => {
+            resolve({ status: statusCode, passed: false });
+          },
+        } as unknown as express.Response;
+
+        const next = () => {
+          resolve({ status: 200, passed: true });
+        };
+
+        middleware(req, res, next);
+      });
+    });
+
+    const results = await Promise.all(requests);
+    // All should pass (status 200) since all have unique transactionIds
+    for (const r of results) {
+      expect(r.passed).toBe(true);
+      expect(r.status).toBe(200);
+    }
+  });
+
+  it("handles 10 concurrent requests with same payment header (replay protection)", async () => {
+    const middleware = midenPaywall(DEFAULT_CONFIG);
+    const paymentHeader = makePaymentHeader({
+      payload: {
+        from: "0xsender_same",
+        provenTransaction: "deadbeef",
+        transactionId: "tx_replay_concurrent",
+      },
+    });
+
+    const requests = Array.from({ length: 10 }, () => {
+      return new Promise<{ status: number; passed: boolean; error?: string }>((resolve) => {
+        const req = {
+          method: "GET",
+          originalUrl: "/api/premium/data",
+          protocol: "http",
+          headers: { payment: paymentHeader },
+          get: (name: string) =>
+            name.toLowerCase() === "host" ? "localhost:3000" : undefined,
+        } as unknown as express.Request;
+
+        let statusCode = 0;
+        let responseBody: Record<string, unknown> = {};
+        const res = {
+          status: (code: number) => {
+            statusCode = code;
+            return res;
+          },
+          json: (body: Record<string, unknown>) => {
+            responseBody = body;
+            resolve({ status: statusCode, passed: false, error: String(responseBody.error ?? "") });
+          },
+        } as unknown as express.Response;
+
+        const next = () => {
+          resolve({ status: 200, passed: true });
+        };
+
+        middleware(req, res, next);
+      });
+    });
+
+    const results = await Promise.all(requests);
+    const passed = results.filter((r) => r.passed);
+    const rejected = results.filter((r) => !r.passed);
+
+    // Only the first should pass; rest should be replays
+    expect(passed.length).toBe(1);
+    expect(rejected.length).toBe(9);
+    for (const r of rejected) {
+      expect(r.status).toBe(402);
+      expect(r.error).toContain("replay");
+    }
+  });
+
   it("rejects replay of same transactionId on second request", async () => {
     const middleware = midenPaywall(DEFAULT_CONFIG);
     const paymentHeader = makePaymentHeader();
