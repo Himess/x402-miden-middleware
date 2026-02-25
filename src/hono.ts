@@ -72,6 +72,12 @@ export function midenPaywall(config: MidenPaywallConfig): MiddlewareHandler {
     // No payment header → return 402
     if (!paymentHeader) {
       const body = buildPaymentRequired(config, c.req.url, c.req.method);
+
+      const privacy = config.privacy ?? "public";
+      if (privacy !== "public") {
+        c.header("x-privacy-mode", privacy);
+      }
+
       return c.json(body, 402);
     }
 

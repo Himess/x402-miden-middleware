@@ -460,6 +460,108 @@ describe("Express midenPaywall", () => {
     expect(statusCode).toBe(0);
   });
 
+  it("does not set x-privacy-mode header for public mode", async () => {
+    const middleware = midenPaywall(DEFAULT_CONFIG);
+
+    const req = {
+      method: "GET",
+      originalUrl: "/api/premium/data",
+      protocol: "http",
+      headers: {},
+      get: (name: string) =>
+        name.toLowerCase() === "host" ? "localhost:3000" : undefined,
+    } as unknown as express.Request;
+
+    const headers: Record<string, string> = {};
+    const res = {
+      status: () => res,
+      setHeader: (name: string, value: string) => { headers[name] = value; },
+      json: () => {},
+    } as unknown as express.Response;
+
+    await middleware(req, res, vi.fn());
+
+    expect(headers).not.toHaveProperty("x-privacy-mode");
+  });
+
+  it("sets x-privacy-mode header for trusted mode", async () => {
+    const config: MidenPaywallConfig = {
+      ...DEFAULT_CONFIG,
+      privacy: "trusted",
+    };
+    const middleware = midenPaywall(config);
+
+    const req = {
+      method: "GET",
+      originalUrl: "/api/premium/data",
+      protocol: "http",
+      headers: {},
+      get: (name: string) =>
+        name.toLowerCase() === "host" ? "localhost:3000" : undefined,
+    } as unknown as express.Request;
+
+    const headers: Record<string, string> = {};
+    const res = {
+      status: () => res,
+      setHeader: (name: string, value: string) => { headers[name] = value; },
+      json: () => {},
+    } as unknown as express.Response;
+
+    await middleware(req, res, vi.fn());
+
+    expect(headers["x-privacy-mode"]).toBe("trusted");
+  });
+
+  it("rejects trusted mode payment without noteData", async () => {
+    const config: MidenPaywallConfig = {
+      ...DEFAULT_CONFIG,
+      privacy: "trusted",
+    };
+    const middleware = midenPaywall(config);
+    const paymentHeader = makePaymentHeader(); // no noteData
+
+    const req = {
+      method: "GET",
+      originalUrl: "/api/premium/data",
+      protocol: "http",
+      headers: { payment: paymentHeader },
+      get: (name: string) =>
+        name.toLowerCase() === "host" ? "localhost:3000" : undefined,
+    } as unknown as express.Request;
+
+    let statusCode = 0;
+    let responseBody: Record<string, unknown> = {};
+
+    const res = {
+      status: (code: number) => {
+        statusCode = code;
+        return res;
+      },
+      json: (body: Record<string, unknown>) => {
+        responseBody = body;
+      },
+    } as unknown as express.Response;
+
+    const next = vi.fn();
+    await middleware(req, res, next);
+
+    expect(statusCode).toBe(402);
+    expect(String(responseBody.error)).toContain("noteData");
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it("throws NotImplemented for encrypted privacy mode", () => {
+    expect(() =>
+      midenPaywall({ ...DEFAULT_CONFIG, privacy: "encrypted" }),
+    ).toThrow("not yet implemented");
+  });
+
+  it("throws NotImplemented for zkproof privacy mode", () => {
+    expect(() =>
+      midenPaywall({ ...DEFAULT_CONFIG, privacy: "zkproof" }),
+    ).toThrow("not yet implemented");
+  });
+
   it("402 response includes proper accepts array", async () => {
     const middleware = midenPaywall(DEFAULT_CONFIG);
 

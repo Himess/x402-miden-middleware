@@ -26,6 +26,8 @@ export function buildPaymentRequired(
   requestUrl: string,
   requestMethod: string,
 ): PaymentRequiredBody {
+  const privacy = config.privacy ?? "public";
+
   const requirements: MidenPaymentRequirements = {
     scheme: "exact",
     network: config.network ?? "miden:testnet",
@@ -33,6 +35,8 @@ export function buildPaymentRequired(
     payTo: config.recipient,
     maxTimeoutSeconds: config.maxTimeoutSeconds ?? 300,
     asset: config.asset,
+    // Only include privacyMode when non-default (keeps backward compat for 'public')
+    ...(privacy !== "public" ? { privacyMode: privacy } : {}),
   };
 
   return {
@@ -156,6 +160,17 @@ export function validatePaymentPayload(
     return { valid: false, error: "Missing proven transaction data" };
   }
 
+  // For 'trusted' privacy mode, noteData is required in the payment payload
+  const privacy = config.privacy ?? "public";
+  if (privacy === "trusted") {
+    if (!payload.payload?.noteData?.trim()) {
+      return {
+        valid: false,
+        error: "Missing noteData: trusted privacy mode requires off-chain note data in the payment payload",
+      };
+    }
+  }
+
   return { valid: true };
 }
 
@@ -182,6 +197,19 @@ export function validateConfig(config: MidenPaywallConfig): void {
   }
   if (!config.recipient || !config.recipient.trim()) {
     throw new Error("midenPaywall: recipient (account ID) is required");
+  }
+
+  // Validate privacy mode
+  const privacy = config.privacy ?? "public";
+  const validModes = ["public", "trusted", "encrypted", "zkproof"];
+  if (!validModes.includes(privacy)) {
+    throw new Error(`midenPaywall: invalid privacy mode "${privacy}". Must be one of: ${validModes.join(", ")}`);
+  }
+  if (privacy === "encrypted") {
+    throw new Error("midenPaywall: privacy mode 'encrypted' is not yet implemented. Use 'public' or 'trusted'.");
+  }
+  if (privacy === "zkproof") {
+    throw new Error("midenPaywall: privacy mode 'zkproof' is not yet implemented. Use 'public' or 'trusted'.");
   }
 }
 

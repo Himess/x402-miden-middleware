@@ -103,6 +103,23 @@ describe("buildPaymentRequired", () => {
     const body = buildPaymentRequired(config, "/api/data", "GET");
     expect(body.error).toBe("Pay 1000 units to read this article");
   });
+
+  it("does not include privacyMode for public (default)", () => {
+    const body = buildPaymentRequired(DEFAULT_CONFIG, "/api/data", "GET");
+    expect(body.accepts[0]).not.toHaveProperty("privacyMode");
+  });
+
+  it("does not include privacyMode when privacy is explicitly 'public'", () => {
+    const config: MidenPaywallConfig = { ...DEFAULT_CONFIG, privacy: "public" };
+    const body = buildPaymentRequired(config, "/api/data", "GET");
+    expect(body.accepts[0]).not.toHaveProperty("privacyMode");
+  });
+
+  it("includes privacyMode for trusted mode", () => {
+    const config: MidenPaywallConfig = { ...DEFAULT_CONFIG, privacy: "trusted" };
+    const body = buildPaymentRequired(config, "/api/data", "GET");
+    expect(body.accepts[0].privacyMode).toBe("trusted");
+  });
 });
 
 // ============================================================================
@@ -268,6 +285,39 @@ describe("validatePaymentPayload", () => {
     expect(result.valid).toBe(false);
     expect(result.error).toContain("Invalid amount");
   });
+
+  it("accepts public mode without noteData", () => {
+    const config: MidenPaywallConfig = { ...DEFAULT_CONFIG, privacy: "public" };
+    const result = validatePaymentPayload(makeValidPayload(), config);
+    expect(result.valid).toBe(true);
+  });
+
+  it("rejects trusted mode when noteData is missing", () => {
+    const config: MidenPaywallConfig = { ...DEFAULT_CONFIG, privacy: "trusted" };
+    const payload = makeValidPayload();
+    // no noteData in payload
+    const result = validatePaymentPayload(payload, config);
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain("noteData");
+    expect(result.error).toContain("trusted");
+  });
+
+  it("accepts trusted mode when noteData is present", () => {
+    const config: MidenPaywallConfig = { ...DEFAULT_CONFIG, privacy: "trusted" };
+    const payload = makeValidPayload();
+    payload.payload.noteData = "aabbccdd";
+    const result = validatePaymentPayload(payload, config);
+    expect(result.valid).toBe(true);
+  });
+
+  it("rejects trusted mode when noteData is whitespace", () => {
+    const config: MidenPaywallConfig = { ...DEFAULT_CONFIG, privacy: "trusted" };
+    const payload = makeValidPayload();
+    payload.payload.noteData = "   ";
+    const result = validatePaymentPayload(payload, config);
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain("noteData");
+  });
 });
 
 // ============================================================================
@@ -313,6 +363,35 @@ describe("validateConfig", () => {
     expect(() =>
       validateConfig({ ...DEFAULT_CONFIG, recipient: "" }),
     ).toThrow("recipient");
+  });
+
+  it("accepts public privacy mode", () => {
+    expect(() =>
+      validateConfig({ ...DEFAULT_CONFIG, privacy: "public" }),
+    ).not.toThrow();
+  });
+
+  it("accepts trusted privacy mode", () => {
+    expect(() =>
+      validateConfig({ ...DEFAULT_CONFIG, privacy: "trusted" }),
+    ).not.toThrow();
+  });
+
+  it("throws NotImplemented for encrypted privacy mode", () => {
+    expect(() =>
+      validateConfig({ ...DEFAULT_CONFIG, privacy: "encrypted" }),
+    ).toThrow("not yet implemented");
+  });
+
+  it("throws NotImplemented for zkproof privacy mode", () => {
+    expect(() =>
+      validateConfig({ ...DEFAULT_CONFIG, privacy: "zkproof" }),
+    ).toThrow("not yet implemented");
+  });
+
+  it("accepts config without privacy (defaults to public)", () => {
+    const { privacy: _, ...configWithoutPrivacy } = DEFAULT_CONFIG;
+    expect(() => validateConfig(configWithoutPrivacy)).not.toThrow();
   });
 });
 

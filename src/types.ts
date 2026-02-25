@@ -7,6 +7,22 @@
  */
 
 // ============================================================================
+// Privacy Mode
+// ============================================================================
+
+/**
+ * Privacy mode for x402 Miden payments.
+ *
+ * - `'public'` (default): Notes are fully visible on-chain. Backward compatible.
+ * - `'trusted'`: Private notes — only hash on-chain. Client shares full note
+ *   data with facilitator off-chain via `noteData` in the payment payload.
+ *   Server adds `x-privacy-mode: trusted` header to 402 responses.
+ * - `'encrypted'`: Reserved for future use (not yet implemented).
+ * - `'zkproof'`: Reserved for future use (not yet implemented).
+ */
+export type PrivacyMode = "public" | "trusted" | "encrypted" | "zkproof";
+
+// ============================================================================
 // x402 Wire-Format Types (compatible with x402-miden-agent-sdk)
 // ============================================================================
 
@@ -24,6 +40,8 @@ export interface MidenPaymentRequirements {
   maxTimeoutSeconds: number;
   /** Token faucet account ID (hex). */
   asset: string;
+  /** Privacy mode required for this payment. Omitted for 'public' (default). */
+  privacyMode?: PrivacyMode;
   /** Optional extra data. */
   extra?: unknown;
 }
@@ -36,6 +54,10 @@ export interface MidenExactPayload {
   provenTransaction: string;
   /** Transaction ID (hex). */
   transactionId: string;
+  /** Privacy mode used for this payment. Defaults to "public". */
+  privacyMode?: PrivacyMode;
+  /** Hex-encoded full Note data for 'trusted' privacy mode (off-chain delivery). */
+  noteData?: string;
 }
 
 /** Full V2 payment payload for the Payment header. */
@@ -60,6 +82,16 @@ export interface MidenPaywallConfig {
   recipient: string;
   /** CAIP-2 network identifier. Defaults to "miden:testnet". */
   network?: string;
+  /**
+   * Privacy mode for payments. Defaults to "public".
+   *
+   * - `'public'`: Default. Notes fully visible on-chain (backward compatible).
+   * - `'trusted'`: Private notes. Adds `x-privacy-mode: trusted` header to 402 responses.
+   *   Client must include `noteData` (hex-encoded full Note) in the payment payload.
+   * - `'encrypted'`: Not yet implemented. Throws at config validation.
+   * - `'zkproof'`: Not yet implemented. Throws at config validation.
+   */
+  privacy?: PrivacyMode;
   /** Facilitator URL for payment verification. */
   facilitatorUrl?: string;
   /** Custom verify function — overrides facilitator URL. Use for testing or inline verification. */

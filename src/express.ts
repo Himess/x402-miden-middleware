@@ -64,6 +64,11 @@ export function midenPaywall(config: MidenPaywallConfig): RequestHandler {
       const requestUrl = `${req.protocol}://${req.get("host") ?? "localhost"}${req.originalUrl}`;
       const body = buildPaymentRequired(config, requestUrl, req.method);
 
+      const privacy = config.privacy ?? "public";
+      if (privacy !== "public") {
+        res.setHeader("x-privacy-mode", privacy);
+      }
+
       res.status(402).json(body);
       return;
     }

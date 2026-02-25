@@ -25,6 +25,7 @@ export {
 
 // Types
 export type {
+  PrivacyMode,
   MidenPaywallConfig,
   PaymentRequiredBody,
   VerifyRequest,

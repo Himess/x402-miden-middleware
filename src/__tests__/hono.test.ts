@@ -246,6 +246,58 @@ describe("Hono midenPaywall", () => {
     expect(body.data).toBe("premium content");
   });
 
+  it("does not set x-privacy-mode header for public mode", async () => {
+    const app = createApp();
+    const res = await app.request("/api/premium/data");
+
+    expect(res.status).toBe(402);
+    expect(res.headers.get("x-privacy-mode")).toBeNull();
+  });
+
+  it("sets x-privacy-mode header for trusted mode", async () => {
+    const config: MidenPaywallConfig = {
+      ...DEFAULT_CONFIG,
+      privacy: "trusted",
+    };
+    const app = createApp(config);
+    const res = await app.request("/api/premium/data");
+
+    expect(res.status).toBe(402);
+    expect(res.headers.get("x-privacy-mode")).toBe("trusted");
+
+    const body = await res.json();
+    expect(body.accepts[0].privacyMode).toBe("trusted");
+  });
+
+  it("rejects trusted mode payment without noteData", async () => {
+    const config: MidenPaywallConfig = {
+      ...DEFAULT_CONFIG,
+      privacy: "trusted",
+    };
+    const app = createApp(config);
+    const paymentHeader = makePaymentHeader(); // no noteData
+
+    const res = await app.request("/api/premium/data", {
+      headers: { Payment: paymentHeader },
+    });
+
+    expect(res.status).toBe(402);
+    const body = await res.json();
+    expect(body.error).toContain("noteData");
+  });
+
+  it("throws NotImplemented for encrypted privacy mode", () => {
+    expect(() =>
+      createApp({ ...DEFAULT_CONFIG, privacy: "encrypted" }),
+    ).toThrow("not yet implemented");
+  });
+
+  it("throws NotImplemented for zkproof privacy mode", () => {
+    expect(() =>
+      createApp({ ...DEFAULT_CONFIG, privacy: "zkproof" }),
+    ).toThrow("not yet implemented");
+  });
+
   it("works with facilitatorUrl (mocked fetch)", async () => {
     const originalFetch = globalThis.fetch;
     const mockFetch = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {
