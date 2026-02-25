@@ -35,7 +35,21 @@ import {
   validateConfig,
 } from "./core.js";
 
-// Hono environment type augmentation for paymentInfo
+/**
+ * Hono environment type for routes behind the paywall.
+ *
+ * Use this as a generic parameter on your Hono instance so that
+ * `c.get("paymentInfo")` is properly typed in downstream handlers:
+ *
+ * ```ts
+ * const app = new Hono<PaymentEnv>();
+ * app.use("/api/premium/*", midenPaywall(config));
+ * app.get("/api/premium/data", (c) => {
+ *   const info = c.get("paymentInfo"); // typed as PaymentInfo
+ *   return c.json({ paidBy: info.from });
+ * });
+ * ```
+ */
 export type PaymentEnv = {
   Variables: {
     paymentInfo: PaymentInfo;

@@ -291,6 +291,175 @@ describe("Express midenPaywall", () => {
     expect(next).not.toHaveBeenCalled();
   });
 
+  it("returns 402 when wrong network", async () => {
+    const middleware = midenPaywall(DEFAULT_CONFIG);
+    const paymentHeader = makePaymentHeader({
+      accepted: {
+        scheme: "exact",
+        network: "miden:mainnet", // config expects testnet
+        amount: "1000",
+        payTo: "0xdef456recipient",
+        maxTimeoutSeconds: 300,
+        asset: "0xabc123faucet",
+      },
+    });
+
+    const req = {
+      method: "GET",
+      originalUrl: "/api/premium/data",
+      protocol: "http",
+      headers: { payment: paymentHeader },
+      get: (name: string) =>
+        name.toLowerCase() === "host" ? "localhost:3000" : undefined,
+    } as unknown as express.Request;
+
+    let statusCode = 0;
+    let responseBody: Record<string, unknown> = {};
+
+    const res = {
+      status: (code: number) => {
+        statusCode = code;
+        return res;
+      },
+      json: (body: Record<string, unknown>) => {
+        responseBody = body;
+      },
+    } as unknown as express.Response;
+
+    const next = vi.fn();
+
+    await middleware(req, res, next);
+
+    expect(statusCode).toBe(402);
+    expect(String(responseBody.error)).toContain("network");
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it("returns 402 when wrong asset", async () => {
+    const middleware = midenPaywall(DEFAULT_CONFIG);
+    const paymentHeader = makePaymentHeader({
+      accepted: {
+        scheme: "exact",
+        network: "miden:testnet",
+        amount: "1000",
+        payTo: "0xdef456recipient",
+        maxTimeoutSeconds: 300,
+        asset: "0xwrongfaucet",
+      },
+    });
+
+    const req = {
+      method: "GET",
+      originalUrl: "/api/premium/data",
+      protocol: "http",
+      headers: { payment: paymentHeader },
+      get: (name: string) =>
+        name.toLowerCase() === "host" ? "localhost:3000" : undefined,
+    } as unknown as express.Request;
+
+    let statusCode = 0;
+    let responseBody: Record<string, unknown> = {};
+
+    const res = {
+      status: (code: number) => {
+        statusCode = code;
+        return res;
+      },
+      json: (body: Record<string, unknown>) => {
+        responseBody = body;
+      },
+    } as unknown as express.Response;
+
+    const next = vi.fn();
+
+    await middleware(req, res, next);
+
+    expect(statusCode).toBe(402);
+    expect(String(responseBody.error)).toContain("asset");
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it("returns 500 when verify function throws", async () => {
+    const config: MidenPaywallConfig = {
+      ...DEFAULT_CONFIG,
+      verifyPayment: async () => {
+        throw new Error("Unexpected verify crash");
+      },
+    };
+
+    const middleware = midenPaywall(config);
+    const paymentHeader = makePaymentHeader();
+
+    const req = {
+      method: "GET",
+      originalUrl: "/api/premium/data",
+      protocol: "http",
+      headers: { payment: paymentHeader },
+      get: (name: string) =>
+        name.toLowerCase() === "host" ? "localhost:3000" : undefined,
+    } as unknown as express.Request;
+
+    let statusCode = 0;
+    let responseBody: Record<string, unknown> = {};
+
+    const res = {
+      status: (code: number) => {
+        statusCode = code;
+        return res;
+      },
+      json: (body: Record<string, unknown>) => {
+        responseBody = body;
+      },
+    } as unknown as express.Response;
+
+    const next = vi.fn();
+
+    await middleware(req, res, next);
+
+    expect(statusCode).toBe(500);
+    expect(String(responseBody.error)).toContain("Unexpected verify crash");
+    expect(next).not.toHaveBeenCalled();
+  });
+
+  it("accepts overpayment", async () => {
+    const middleware = midenPaywall(DEFAULT_CONFIG);
+    const paymentHeader = makePaymentHeader({
+      accepted: {
+        scheme: "exact",
+        network: "miden:testnet",
+        amount: "5000", // > required 1000
+        payTo: "0xdef456recipient",
+        maxTimeoutSeconds: 300,
+        asset: "0xabc123faucet",
+      },
+    });
+
+    const req = {
+      method: "GET",
+      originalUrl: "/api/premium/data",
+      protocol: "http",
+      headers: { payment: paymentHeader },
+      get: (name: string) =>
+        name.toLowerCase() === "host" ? "localhost:3000" : undefined,
+    } as unknown as express.Request;
+
+    let statusCode = 0;
+    const res = {
+      status: (code: number) => {
+        statusCode = code;
+        return res;
+      },
+      json: vi.fn(),
+    } as unknown as express.Response;
+
+    const next = vi.fn();
+
+    await middleware(req, res, next);
+
+    expect(next).toHaveBeenCalledOnce();
+    expect(statusCode).toBe(0);
+  });
+
   it("402 response includes proper accepts array", async () => {
     const middleware = midenPaywall(DEFAULT_CONFIG);
 
