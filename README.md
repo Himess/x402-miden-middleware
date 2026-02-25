@@ -105,6 +105,8 @@ Client (AI Agent)              Your Server                  Facilitator
 | `verifyPayment` | `function` | No | — | Custom verify function (overrides facilitatorUrl) |
 | `maxTimeoutSeconds` | `number` | No | `300` | Payment validity window |
 | `description` | `string` | No | — | Human-readable description for 402 response |
+| `logger` | `PaywallLogger` | No | `console` | Structured logger with `info`, `warn`, `error` methods |
+| `verifyTimeoutMs` | `number` | No | `10000` | Timeout in ms for facilitator fetch requests |
 
 ## Payment Verification
 
@@ -112,7 +114,7 @@ Three modes (in priority order):
 
 1. **Custom function** — `verifyPayment: async (payload) => ({ valid: true })`
 2. **Remote facilitator** — `facilitatorUrl: "http://localhost:4402"` → sends POST to `/verify`
-3. **Dev mode** — No config → accepts with console warning (not for production)
+3. **No config** — No config → rejects all payments (secure by default). Set `facilitatorUrl` or `verifyPayment` to enable verification.
 
 ## Accessing Payment Info
 

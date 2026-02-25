@@ -34,6 +34,8 @@ import {
   verifyPayment,
   extractPaymentInfo,
   validateConfig,
+  resolveLogger,
+  createReplayGuard,
 } from "./core.js";
 
 // Extend Express Request to include paymentInfo
@@ -56,10 +58,13 @@ declare global {
 export function midenPaywall(config: MidenPaywallConfig): RequestHandler {
   validateConfig(config);
 
+  const log = resolveLogger(config);
+  const replayGuard = createReplayGuard();
+
   return async (req: Request, res: Response, next: NextFunction) => {
     const paymentHeader = req.headers["payment"] as string | undefined;
 
-    // No payment header → return 402
+    // No payment header -> return 402
     if (!paymentHeader) {
       const requestUrl = `${req.protocol}://${req.get("host") ?? "localhost"}${req.originalUrl}`;
       const body = buildPaymentRequired(config, requestUrl, req.method);
@@ -69,6 +74,7 @@ export function midenPaywall(config: MidenPaywallConfig): RequestHandler {
         res.setHeader("x-privacy-mode", privacy);
       }
 
+      log.warn("No Payment header present, returning 402", requestUrl);
       res.status(402).json(body);
       return;
     }
@@ -92,11 +98,23 @@ export function midenPaywall(config: MidenPaywallConfig): RequestHandler {
         return;
       }
 
+      // Replay protection: reject duplicate transaction IDs
+      const txId = payload.payload.transactionId;
+      if (!replayGuard.check(txId)) {
+        log.warn("Payment replay detected", txId);
+        res.status(402).json({
+          error: "Payment replay detected: transaction already used",
+          x402Version: 2,
+        });
+        return;
+      }
+
       // Attach payment info to request for downstream handlers
       req.paymentInfo = extractPaymentInfo(payload);
 
       next();
     } catch (err) {
+      log.error("Payment verification error", err instanceof Error ? err.message : String(err));
       res.status(500).json({
         error: `Payment verification error: ${err instanceof Error ? err.message : String(err)}`,
       });

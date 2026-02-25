@@ -21,12 +21,14 @@ export {
   validateConfig,
   verifyPayment,
   extractPaymentInfo,
+  createReplayGuard,
 } from "./core.js";
 
 // Types
 export type {
   PrivacyMode,
   MidenPaywallConfig,
+  PaywallLogger,
   PaymentRequiredBody,
   VerifyRequest,
   VerifyResponse,

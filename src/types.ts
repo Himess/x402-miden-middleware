@@ -72,6 +72,13 @@ export interface V2PaymentPayload {
 // Middleware Configuration Types
 // ============================================================================
 
+/** Structured logger interface for middleware observability. */
+export interface PaywallLogger {
+  warn: (msg: string, ...args: unknown[]) => void;
+  error: (msg: string, ...args: unknown[]) => void;
+  info: (msg: string, ...args: unknown[]) => void;
+}
+
 /** Configuration for the midenPaywall middleware. */
 export interface MidenPaywallConfig {
   /** Payment amount in token's smallest unit (string to avoid BigInt serialization issues). */
@@ -100,6 +107,10 @@ export interface MidenPaywallConfig {
   maxTimeoutSeconds?: number;
   /** Optional description shown to the client about what they're paying for. */
   description?: string;
+  /** Structured logger. Defaults to `console` if not provided. */
+  logger?: PaywallLogger;
+  /** Timeout in milliseconds for facilitator fetch requests. Defaults to 10000 (10s). */
+  verifyTimeoutMs?: number;
 }
 
 /** Lightweight resource info for 402 response. */

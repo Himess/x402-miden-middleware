@@ -596,4 +596,55 @@ describe("Express midenPaywall", () => {
       asset: "0xabc123faucet",
     });
   });
+
+  it("rejects replay of same transactionId on second request", async () => {
+    const middleware = midenPaywall(DEFAULT_CONFIG);
+    const paymentHeader = makePaymentHeader();
+
+    // Helper to create a mock request/response pair
+    function makeMocks() {
+      const req = {
+        method: "GET",
+        originalUrl: "/api/premium/data",
+        protocol: "http",
+        headers: { payment: paymentHeader },
+        get: (name: string) =>
+          name.toLowerCase() === "host" ? "localhost:3000" : undefined,
+      } as unknown as express.Request;
+
+      let statusCode = 0;
+      let responseBody: Record<string, unknown> = {};
+      const res = {
+        status: (code: number) => {
+          statusCode = code;
+          return res;
+        },
+        json: (body: Record<string, unknown>) => {
+          responseBody = body;
+        },
+      } as unknown as express.Response;
+
+      const next = vi.fn();
+
+      return {
+        req,
+        res,
+        next,
+        getStatus: () => statusCode,
+        getBody: () => responseBody,
+      };
+    }
+
+    // First request: should pass through
+    const first = makeMocks();
+    await middleware(first.req, first.res, first.next);
+    expect(first.next).toHaveBeenCalledOnce();
+
+    // Second request with same transactionId: should be rejected as replay
+    const second = makeMocks();
+    await middleware(second.req, second.res, second.next);
+    expect(second.getStatus()).toBe(402);
+    expect(String(second.getBody().error)).toContain("replay");
+    expect(second.next).not.toHaveBeenCalled();
+  });
 });

@@ -33,6 +33,8 @@ import {
   verifyPayment,
   extractPaymentInfo,
   validateConfig,
+  resolveLogger,
+  createReplayGuard,
 } from "./core.js";
 
 /**
@@ -66,10 +68,13 @@ export type PaymentEnv = {
 export function midenPaywall(config: MidenPaywallConfig): MiddlewareHandler {
   validateConfig(config);
 
+  const log = resolveLogger(config);
+  const replayGuard = createReplayGuard();
+
   return async (c: Context, next) => {
     const paymentHeader = c.req.header("payment");
 
-    // No payment header → return 402
+    // No payment header -> return 402
     if (!paymentHeader) {
       const body = buildPaymentRequired(config, c.req.url, c.req.method);
 
@@ -78,6 +83,7 @@ export function midenPaywall(config: MidenPaywallConfig): MiddlewareHandler {
         c.header("x-privacy-mode", privacy);
       }
 
+      log.warn("No Payment header present, returning 402", c.req.url);
       return c.json(body, 402);
     }
 
@@ -101,11 +107,25 @@ export function midenPaywall(config: MidenPaywallConfig): MiddlewareHandler {
         );
       }
 
+      // Replay protection: reject duplicate transaction IDs
+      const txId = payload.payload.transactionId;
+      if (!replayGuard.check(txId)) {
+        log.warn("Payment replay detected", txId);
+        return c.json(
+          {
+            error: "Payment replay detected: transaction already used",
+            x402Version: 2,
+          },
+          402,
+        );
+      }
+
       // Attach payment info to context for downstream handlers
       c.set("paymentInfo", extractPaymentInfo(payload));
 
       await next();
     } catch (err) {
+      log.error("Payment verification error", err instanceof Error ? err.message : String(err));
       return c.json(
         {
           error: `Payment verification error: ${err instanceof Error ? err.message : String(err)}`,

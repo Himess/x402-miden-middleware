@@ -298,6 +298,27 @@ describe("Hono midenPaywall", () => {
     ).toThrow("not yet implemented");
   });
 
+  it("rejects replay of same transactionId on second request", async () => {
+    const app = createApp();
+    const paymentHeader = makePaymentHeader();
+
+    // First request — should pass
+    const res1 = await app.request("/api/premium/data", {
+      headers: { Payment: paymentHeader },
+    });
+    expect(res1.status).toBe(200);
+    const body1 = await res1.json();
+    expect(body1.data).toBe("premium content");
+
+    // Second request with same transactionId — should be rejected as replay
+    const res2 = await app.request("/api/premium/data", {
+      headers: { Payment: paymentHeader },
+    });
+    expect(res2.status).toBe(402);
+    const body2 = await res2.json();
+    expect(body2.error).toContain("replay");
+  });
+
   it("works with facilitatorUrl (mocked fetch)", async () => {
     const originalFetch = globalThis.fetch;
     const mockFetch = vi.fn().mockImplementation(async (url: string, init?: RequestInit) => {

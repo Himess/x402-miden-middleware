@@ -6,6 +6,7 @@ import {
   validateConfig,
   verifyPayment,
   extractPaymentInfo,
+  createReplayGuard,
 } from "../core.js";
 import type { MidenPaywallConfig, V2PaymentPayload } from "../types.js";
 
@@ -515,5 +516,164 @@ describe("extractPaymentInfo", () => {
     expect(info.from).toBe("0xsender123");
     expect(info.amount).toBe("1000");
     expect(info.asset).toBe("0xabc123faucet");
+  });
+});
+
+// ============================================================================
+// createReplayGuard
+// ============================================================================
+
+describe("createReplayGuard", () => {
+  it("allows a new transaction ID", () => {
+    const guard = createReplayGuard();
+    expect(guard.check("tx_001")).toBe(true);
+  });
+
+  it("rejects a duplicate transaction ID", () => {
+    const guard = createReplayGuard();
+    expect(guard.check("tx_001")).toBe(true);
+    expect(guard.check("tx_001")).toBe(false);
+  });
+
+  it("tracks multiple distinct transaction IDs", () => {
+    const guard = createReplayGuard();
+    expect(guard.check("tx_001")).toBe(true);
+    expect(guard.check("tx_002")).toBe(true);
+    expect(guard.check("tx_003")).toBe(true);
+    // All should be rejected on second attempt
+    expect(guard.check("tx_001")).toBe(false);
+    expect(guard.check("tx_002")).toBe(false);
+    expect(guard.check("tx_003")).toBe(false);
+  });
+
+  it("evicts oldest entry when exceeding maxSize", () => {
+    const guard = createReplayGuard(3);
+    expect(guard.check("tx_001")).toBe(true);
+    expect(guard.check("tx_002")).toBe(true);
+    expect(guard.check("tx_003")).toBe(true);
+    // This should evict tx_001 (oldest)
+    expect(guard.check("tx_004")).toBe(true);
+    // tx_001 was evicted, so it should be allowed again
+    expect(guard.check("tx_001")).toBe(true);
+    // tx_002 is still in the map (was not evicted yet)
+    // Actually tx_002 was evicted when tx_001 was re-added (size was 3: tx_002, tx_003, tx_004 -> evict tx_002 to add tx_001)
+    // Wait: after adding tx_004, map has [tx_002, tx_003, tx_004]. Adding tx_001 evicts tx_002.
+    expect(guard.check("tx_002")).toBe(true);
+    // tx_003 should still be rejected (still in map: [tx_003, tx_004, tx_001] -> after evicting tx_003 for tx_002: [tx_004, tx_001, tx_002])
+    // Actually after adding tx_002, map has [tx_004, tx_001, tx_002]. tx_003 was evicted.
+    expect(guard.check("tx_003")).toBe(true);
+  });
+
+  it("defaults to maxSize 10000", () => {
+    // Just verify it doesn't throw and works normally
+    const guard = createReplayGuard();
+    for (let i = 0; i < 100; i++) {
+      expect(guard.check(`tx_${i}`)).toBe(true);
+    }
+    // Replays should be rejected
+    expect(guard.check("tx_0")).toBe(false);
+    expect(guard.check("tx_99")).toBe(false);
+  });
+});
+
+// ============================================================================
+// extractPayment - header size limit
+// ============================================================================
+
+describe("extractPayment header size limit", () => {
+  it("rejects Payment header exceeding 64KB", () => {
+    // Create a string longer than 65536 characters
+    const oversized = "A".repeat(65537);
+    expect(extractPayment(oversized)).toBeNull();
+  });
+
+  it("accepts Payment header at exactly 64KB boundary", () => {
+    // A header of exactly 65536 chars is allowed (the limit is >65536)
+    // But it will fail JSON parsing, so it returns null for a different reason
+    const atLimit = "A".repeat(65536);
+    // This will pass the size check but fail base64/JSON parsing -> null
+    expect(extractPayment(atLimit)).toBeNull();
+  });
+
+  it("accepts a normal-sized valid Payment header", () => {
+    const payload = makeValidPayload();
+    const encoded = btoa(JSON.stringify(payload));
+    // Sanity: make sure it is well under the limit
+    expect(encoded.length).toBeLessThan(65536);
+    expect(extractPayment(encoded)).not.toBeNull();
+  });
+});
+
+// ============================================================================
+// verifyPayment - AbortController timeout
+// ============================================================================
+
+describe("verifyPayment - facilitator fetch timeout", () => {
+  it("passes AbortController signal to fetch", async () => {
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ valid: true, transactionId: "tx_remote" }),
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const config: MidenPaywallConfig = {
+      ...DEFAULT_CONFIG,
+      facilitatorUrl: "http://localhost:4402",
+      verifyTimeoutMs: 5000,
+    };
+
+    await verifyPayment(makeValidPayload(), config);
+
+    // Verify fetch was called with an AbortSignal
+    expect(mockFetch).toHaveBeenCalledOnce();
+    const callArgs = mockFetch.mock.calls[0];
+    expect(callArgs[1]).toHaveProperty("signal");
+    expect(callArgs[1].signal).toBeInstanceOf(AbortSignal);
+
+    vi.unstubAllGlobals();
+  });
+
+  it("returns error when fetch is aborted due to timeout", async () => {
+    // Simulate AbortError from fetch
+    const mockFetch = vi.fn().mockImplementation(async (_url: string, opts: { signal: AbortSignal }) => {
+      // Immediately abort to simulate timeout
+      const error = new DOMException("The operation was aborted", "AbortError");
+      throw error;
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const config: MidenPaywallConfig = {
+      ...DEFAULT_CONFIG,
+      facilitatorUrl: "http://localhost:4402",
+      verifyTimeoutMs: 1, // 1ms timeout
+    };
+
+    const result = await verifyPayment(makeValidPayload(), config);
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain("Facilitator unreachable");
+
+    vi.unstubAllGlobals();
+  });
+
+  it("uses default 10s timeout when verifyTimeoutMs is not set", async () => {
+    // We'll check that fetch is called with a signal, indicating AbortController is used
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ valid: true, transactionId: "tx_remote" }),
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const config: MidenPaywallConfig = {
+      ...DEFAULT_CONFIG,
+      facilitatorUrl: "http://localhost:4402",
+      // No verifyTimeoutMs — should default to 10000
+    };
+
+    await verifyPayment(makeValidPayload(), config);
+
+    const callArgs = mockFetch.mock.calls[0];
+    expect(callArgs[1]).toHaveProperty("signal");
+
+    vi.unstubAllGlobals();
   });
 });

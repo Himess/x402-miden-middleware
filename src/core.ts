@@ -5,6 +5,7 @@
  * - Building 402 Payment Required responses
  * - Decoding Payment headers
  * - Verifying payments via facilitator (remote or inline)
+ * - Replay protection via LRU transaction ID dedup
  */
 
 import type {
@@ -14,7 +15,56 @@ import type {
   PaymentRequiredBody,
   VerifyResponse,
   PaymentInfo,
+  PaywallLogger,
 } from "./types.js";
+
+/** Default logger — falls back to console. */
+const defaultLogger: PaywallLogger = {
+  warn: console.warn.bind(console),
+  error: console.error.bind(console),
+  info: console.info.bind(console),
+};
+
+/** Resolves the logger from config, defaulting to console. */
+export function resolveLogger(config: MidenPaywallConfig): PaywallLogger {
+  return config.logger ?? defaultLogger;
+}
+
+// ============================================================================
+// Replay Guard
+// ============================================================================
+
+/**
+ * Creates an in-memory LRU-like replay guard that tracks seen transaction IDs.
+ *
+ * When the map exceeds `maxSize`, the oldest entry is evicted (FIFO via Map iteration order).
+ *
+ * @param maxSize Maximum number of transaction IDs to retain. Defaults to 10000.
+ */
+export function createReplayGuard(maxSize = 10000) {
+  const seen = new Map<string, number>();
+  return {
+    /**
+     * Checks whether a transaction ID has already been seen.
+     *
+     * @returns `true` if the transaction is new (allowed), `false` if it is a replay.
+     */
+    check(transactionId: string): boolean {
+      if (seen.has(transactionId)) return false;
+      if (seen.size >= maxSize) {
+        // Evict oldest entry (first key in Map iteration order)
+        const oldest = seen.keys().next().value;
+        if (oldest !== undefined) seen.delete(oldest);
+      }
+      seen.set(transactionId, Date.now());
+      return true;
+    },
+  };
+}
+
+// ============================================================================
+// Payment Required Response Builder
+// ============================================================================
 
 /**
  * Builds the 402 Payment Required response body.
@@ -47,6 +97,13 @@ export function buildPaymentRequired(
   };
 }
 
+// ============================================================================
+// Payment Header Extraction
+// ============================================================================
+
+/** Maximum allowed Payment header length (64 KB). Prevents base64 decode DoS. */
+const MAX_PAYMENT_HEADER_LENGTH = 65536;
+
 /**
  * Extracts and decodes the Payment header from a request.
  *
@@ -58,6 +115,12 @@ export function extractPayment(
   paymentHeader: string | null | undefined,
 ): V2PaymentPayload | null {
   if (!paymentHeader) return null;
+
+  // Reject oversized Payment headers to prevent base64 decode DoS.
+  // 64 KB is generous for any legitimate payment payload.
+  if (paymentHeader.length > MAX_PAYMENT_HEADER_LENGTH) {
+    return null;
+  }
 
   try {
     const json = atob(paymentHeader);
@@ -95,6 +158,10 @@ export function extractPayment(
     return null;
   }
 }
+
+// ============================================================================
+// Payment Payload Validation
+// ============================================================================
 
 /**
  * Validates that a payment payload matches the expected requirements.
@@ -174,6 +241,10 @@ export function validatePaymentPayload(
   return { valid: true };
 }
 
+// ============================================================================
+// Config Validation
+// ============================================================================
+
 /**
  * Validates the middleware configuration at creation time.
  * Throws if config is invalid.
@@ -213,6 +284,10 @@ export function validateConfig(config: MidenPaywallConfig): void {
   }
 }
 
+// ============================================================================
+// Payment Verification
+// ============================================================================
+
 /**
  * Verifies a payment with the facilitator.
  *
@@ -225,23 +300,38 @@ export async function verifyPayment(
   payload: V2PaymentPayload,
   config: MidenPaywallConfig,
 ): Promise<VerifyResponse> {
+  const log = resolveLogger(config);
+
   // First: validate the payload locally
   const localValidation = validatePaymentPayload(payload, config);
   if (!localValidation.valid) {
+    log.warn("Payment verification failed (local validation)", localValidation.error);
     return { valid: false, error: localValidation.error };
   }
 
   // Custom verify function takes priority
   if (config.verifyPayment) {
-    return config.verifyPayment(payload);
+    try {
+      const result = await config.verifyPayment(payload);
+      if (result.valid) {
+        log.info("Payment verified successfully", payload.payload.transactionId);
+      } else {
+        log.warn("Payment verification failed", result.error);
+      }
+      return result;
+    } catch (err) {
+      log.error("Verification threw an error", err instanceof Error ? err.message : String(err));
+      throw err;
+    }
   }
 
   // Remote facilitator
   if (config.facilitatorUrl) {
-    return verifyWithFacilitator(payload, config.facilitatorUrl);
+    return verifyWithFacilitator(payload, config.facilitatorUrl, config);
   }
 
   // No facilitator configured — reject by default (secure)
+  log.warn("Payment verification failed", "No facilitator configured");
   return {
     valid: false,
     error:
@@ -251,23 +341,33 @@ export async function verifyPayment(
 
 /**
  * Sends verification request to a remote facilitator service.
+ *
+ * Uses an AbortController to enforce a timeout on the fetch request.
  */
 async function verifyWithFacilitator(
   payload: V2PaymentPayload,
   facilitatorUrl: string,
+  config: MidenPaywallConfig,
 ): Promise<VerifyResponse> {
+  const log = resolveLogger(config);
   const url = `${facilitatorUrl.replace(/\/$/, "")}/verify`;
+  const timeoutMs = config.verifyTimeoutMs ?? 10000;
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const response = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ payload }),
+      signal: controller.signal,
     });
 
     if (!response.ok) {
       const text = await response.text().catch(() => "");
       const truncated = text.length > 500 ? text.slice(0, 500) + "..." : text;
+      log.warn("Payment verification failed", `Facilitator returned ${response.status}`);
       return {
         valid: false,
         error: `Facilitator returned ${response.status}: ${truncated}`,
@@ -275,14 +375,26 @@ async function verifyWithFacilitator(
     }
 
     const result = (await response.json()) as VerifyResponse;
+    if (result.valid) {
+      log.info("Payment verified successfully", payload.payload.transactionId);
+    } else {
+      log.warn("Payment verification failed", result.error);
+    }
     return result;
   } catch (err) {
+    log.error("Facilitator unreachable", err instanceof Error ? err.message : String(err));
     return {
       valid: false,
       error: `Facilitator unreachable: ${err instanceof Error ? err.message : String(err)}`,
     };
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
+
+// ============================================================================
+// Payment Info Extraction
+// ============================================================================
 
 /**
  * Extracts payment info from a verified payload.
