@@ -33,6 +33,7 @@ import {
   extractPayment,
   verifyPayment,
   extractPaymentInfo,
+  validateConfig,
 } from "./core.js";
 
 // Extend Express Request to include paymentInfo
@@ -53,6 +54,8 @@ declare global {
  * with `req.paymentInfo` populated.
  */
 export function midenPaywall(config: MidenPaywallConfig): RequestHandler {
+  validateConfig(config);
+
   return async (req: Request, res: Response, next: NextFunction) => {
     const paymentHeader = req.headers["payment"] as string | undefined;
 

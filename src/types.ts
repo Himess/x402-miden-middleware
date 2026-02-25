@@ -109,6 +109,7 @@ export type VerifyPaymentFn = (
 export interface PaymentRequiredBody {
   x402Version: 2;
   accepts: MidenPaymentRequirements[];
+  resource?: { url: string; method: string };
   error?: string;
 }
 

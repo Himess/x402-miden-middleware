@@ -32,6 +32,7 @@ import {
   extractPayment,
   verifyPayment,
   extractPaymentInfo,
+  validateConfig,
 } from "./core.js";
 
 // Hono environment type augmentation for paymentInfo
@@ -49,6 +50,8 @@ export type PaymentEnv = {
  * with `c.get("paymentInfo")` populated.
  */
 export function midenPaywall(config: MidenPaywallConfig): MiddlewareHandler {
+  validateConfig(config);
+
   return async (c: Context, next) => {
     const paymentHeader = c.req.header("payment");
 

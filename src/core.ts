@@ -38,6 +38,7 @@ export function buildPaymentRequired(
   return {
     x402Version: 2,
     accepts: [requirements],
+    resource: { url: requestUrl, method: requestMethod },
     error: config.description ?? "Payment required to access this resource",
   };
 }
@@ -56,7 +57,36 @@ export function extractPayment(
 
   try {
     const json = atob(paymentHeader);
-    return JSON.parse(json) as V2PaymentPayload;
+    const parsed = JSON.parse(json) as Record<string, unknown>;
+
+    // Runtime validation of required fields
+    if (
+      parsed.x402Version !== 2 ||
+      !parsed.accepted ||
+      typeof parsed.accepted !== "object" ||
+      !parsed.payload ||
+      typeof parsed.payload !== "object"
+    ) {
+      return null;
+    }
+
+    const accepted = parsed.accepted as Record<string, unknown>;
+    const payload = parsed.payload as Record<string, unknown>;
+
+    if (
+      typeof accepted.scheme !== "string" ||
+      typeof accepted.network !== "string" ||
+      typeof accepted.amount !== "string" ||
+      typeof accepted.payTo !== "string" ||
+      typeof accepted.asset !== "string" ||
+      typeof payload.from !== "string" ||
+      typeof payload.provenTransaction !== "string" ||
+      typeof payload.transactionId !== "string"
+    ) {
+      return null;
+    }
+
+    return parsed as unknown as V2PaymentPayload;
   } catch {
     return null;
   }
@@ -105,8 +135,15 @@ export function validatePaymentPayload(
   }
 
   // Amount check: paid amount must be >= required amount
-  const paidAmount = BigInt(accepted.amount);
-  const requiredAmount = BigInt(config.price);
+  let paidAmount: bigint;
+  let requiredAmount: bigint;
+  try {
+    paidAmount = BigInt(accepted.amount);
+    requiredAmount = BigInt(config.price);
+  } catch {
+    return { valid: false, error: `Invalid amount format: "${accepted.amount}" or "${config.price}"` };
+  }
+
   if (paidAmount < requiredAmount) {
     return {
       valid: false,
@@ -114,12 +151,38 @@ export function validatePaymentPayload(
     };
   }
 
-  // Check payload has required fields
-  if (!payload.payload?.provenTransaction || !payload.payload?.transactionId) {
+  // Check payload has required fields (non-empty)
+  if (!payload.payload?.provenTransaction?.trim() || !payload.payload?.transactionId?.trim()) {
     return { valid: false, error: "Missing proven transaction data" };
   }
 
   return { valid: true };
+}
+
+/**
+ * Validates the middleware configuration at creation time.
+ * Throws if config is invalid.
+ */
+export function validateConfig(config: MidenPaywallConfig): void {
+  if (!config.price || !config.price.trim()) {
+    throw new Error("midenPaywall: price is required");
+  }
+  try {
+    const amount = BigInt(config.price);
+    if (amount <= 0n) {
+      throw new Error("midenPaywall: price must be positive");
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith("midenPaywall:")) throw err;
+    throw new Error(`midenPaywall: invalid price "${config.price}" — must be a valid integer string`);
+  }
+
+  if (!config.asset || !config.asset.trim()) {
+    throw new Error("midenPaywall: asset (faucet ID) is required");
+  }
+  if (!config.recipient || !config.recipient.trim()) {
+    throw new Error("midenPaywall: recipient (account ID) is required");
+  }
 }
 
 /**
@@ -128,7 +191,7 @@ export function validatePaymentPayload(
  * Uses either:
  * - A custom verify function (for testing or inline verification)
  * - A remote facilitator URL (for production)
- * - No verification (if neither is configured — logs warning and passes through)
+ * - Rejects if neither is configured (secure by default)
  */
 export async function verifyPayment(
   payload: V2PaymentPayload,
@@ -150,17 +213,11 @@ export async function verifyPayment(
     return verifyWithFacilitator(payload, config.facilitatorUrl);
   }
 
-  // No facilitator configured — accept with warning
-  // TODO: In production, this should reject. For development convenience, we pass through.
-  console.warn(
-    "[x402-miden-middleware] No facilitator configured. " +
-      "Payment accepted without on-chain verification. " +
-      "Set facilitatorUrl or verifyPayment for production use.",
-  );
-
+  // No facilitator configured — reject by default (secure)
   return {
-    valid: true,
-    transactionId: payload.payload.transactionId,
+    valid: false,
+    error:
+      "No facilitator configured. Set facilitatorUrl or verifyPayment to enable payment verification.",
   };
 }
 
@@ -181,10 +238,11 @@ async function verifyWithFacilitator(
     });
 
     if (!response.ok) {
-      const text = await response.text();
+      const text = await response.text().catch(() => "");
+      const truncated = text.length > 500 ? text.slice(0, 500) + "..." : text;
       return {
         valid: false,
-        error: `Facilitator returned ${response.status}: ${text}`,
+        error: `Facilitator returned ${response.status}: ${truncated}`,
       };
     }
 

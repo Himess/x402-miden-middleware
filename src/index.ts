@@ -18,6 +18,7 @@ export {
   buildPaymentRequired,
   extractPayment,
   validatePaymentPayload,
+  validateConfig,
   verifyPayment,
   extractPaymentInfo,
 } from "./core.js";

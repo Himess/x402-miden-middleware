@@ -1,8 +1,9 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   buildPaymentRequired,
   extractPayment,
   validatePaymentPayload,
+  validateConfig,
   verifyPayment,
   extractPaymentInfo,
 } from "../core.js";
@@ -63,6 +64,18 @@ describe("buildPaymentRequired", () => {
     expect(body.accepts[0].maxTimeoutSeconds).toBe(300);
   });
 
+  it("includes resource info from request", () => {
+    const body = buildPaymentRequired(
+      DEFAULT_CONFIG,
+      "https://api.example.com/premium",
+      "GET",
+    );
+    expect(body.resource).toEqual({
+      url: "https://api.example.com/premium",
+      method: "GET",
+    });
+  });
+
   it("uses default network when not specified", () => {
     const config: MidenPaywallConfig = {
       price: "500",
@@ -110,6 +123,39 @@ describe("extractPayment", () => {
   it("returns null for valid base64 but invalid JSON", () => {
     const encoded = btoa("not json at all");
     expect(extractPayment(encoded)).toBeNull();
+  });
+
+  it("returns null for JSON with missing required fields", () => {
+    // Missing payload
+    const noPayload = btoa(JSON.stringify({ x402Version: 2, accepted: {} }));
+    expect(extractPayment(noPayload)).toBeNull();
+
+    // Missing accepted
+    const noAccepted = btoa(JSON.stringify({ x402Version: 2, payload: {} }));
+    expect(extractPayment(noAccepted)).toBeNull();
+
+    // Wrong version
+    const wrongVersion = btoa(JSON.stringify({ x402Version: 1, accepted: {}, payload: {} }));
+    expect(extractPayment(wrongVersion)).toBeNull();
+  });
+
+  it("returns null for payload with wrong field types", () => {
+    const badPayload = btoa(JSON.stringify({
+      x402Version: 2,
+      accepted: {
+        scheme: 123, // should be string
+        network: "miden:testnet",
+        amount: "1000",
+        payTo: "0xrecipient",
+        asset: "0xfaucet",
+      },
+      payload: {
+        from: "0xsender",
+        provenTransaction: "deadbeef",
+        transactionId: "tx_001",
+      },
+    }));
+    expect(extractPayment(badPayload)).toBeNull();
   });
 
   it("decodes a valid payment header", () => {
@@ -191,12 +237,82 @@ describe("validatePaymentPayload", () => {
     expect(result.error).toContain("proven transaction");
   });
 
+  it("rejects whitespace-only provenTransaction", () => {
+    const payload = makeValidPayload();
+    payload.payload.provenTransaction = "   ";
+    const result = validatePaymentPayload(payload, DEFAULT_CONFIG);
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain("proven transaction");
+  });
+
   it("rejects missing transactionId", () => {
     const payload = makeValidPayload();
     payload.payload.transactionId = "";
     const result = validatePaymentPayload(payload, DEFAULT_CONFIG);
     expect(result.valid).toBe(false);
     expect(result.error).toContain("proven transaction");
+  });
+
+  it("rejects invalid amount format", () => {
+    const payload = makeValidPayload();
+    payload.accepted.amount = "abc"; // not a valid BigInt
+    const result = validatePaymentPayload(payload, DEFAULT_CONFIG);
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain("Invalid amount");
+  });
+
+  it("rejects decimal amount", () => {
+    const payload = makeValidPayload();
+    payload.accepted.amount = "10.5";
+    const result = validatePaymentPayload(payload, DEFAULT_CONFIG);
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain("Invalid amount");
+  });
+});
+
+// ============================================================================
+// validateConfig
+// ============================================================================
+
+describe("validateConfig", () => {
+  it("accepts valid config", () => {
+    expect(() => validateConfig(DEFAULT_CONFIG)).not.toThrow();
+  });
+
+  it("throws for empty price", () => {
+    expect(() =>
+      validateConfig({ ...DEFAULT_CONFIG, price: "" }),
+    ).toThrow("price is required");
+  });
+
+  it("throws for non-numeric price", () => {
+    expect(() =>
+      validateConfig({ ...DEFAULT_CONFIG, price: "abc" }),
+    ).toThrow("invalid price");
+  });
+
+  it("throws for zero price", () => {
+    expect(() =>
+      validateConfig({ ...DEFAULT_CONFIG, price: "0" }),
+    ).toThrow("price must be positive");
+  });
+
+  it("throws for negative price", () => {
+    expect(() =>
+      validateConfig({ ...DEFAULT_CONFIG, price: "-100" }),
+    ).toThrow("price must be positive");
+  });
+
+  it("throws for empty asset", () => {
+    expect(() =>
+      validateConfig({ ...DEFAULT_CONFIG, asset: "" }),
+    ).toThrow("asset");
+  });
+
+  it("throws for empty recipient", () => {
+    expect(() =>
+      validateConfig({ ...DEFAULT_CONFIG, recipient: "" }),
+    ).toThrow("recipient");
   });
 });
 
@@ -294,9 +410,7 @@ describe("verifyPayment", () => {
     vi.unstubAllGlobals();
   });
 
-  it("passes through when no facilitator configured (dev mode)", async () => {
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-
+  it("rejects when no facilitator configured (secure by default)", async () => {
     const config: MidenPaywallConfig = {
       price: "1000",
       asset: "0xabc123faucet",
@@ -304,10 +418,8 @@ describe("verifyPayment", () => {
     };
 
     const result = await verifyPayment(makeValidPayload(), config);
-    expect(result.valid).toBe(true);
-    expect(warnSpy).toHaveBeenCalledOnce();
-
-    warnSpy.mockRestore();
+    expect(result.valid).toBe(false);
+    expect(result.error).toContain("No facilitator configured");
   });
 });
 
